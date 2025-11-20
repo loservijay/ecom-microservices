@@ -1,0 +1,62 @@
+name: CI - smoke test services
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  smoke-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [ user-service, product-service, order-service, payment-service ]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Use Node 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install deps for ${{ matrix.service }}
+        working-directory: ${{ matrix.service }}
+        run: npm ci
+
+      - name: Start ${{ matrix.service }} in background
+        working-directory: ${{ matrix.service }}
+        run: |
+          nohup node index.js > ../${{ matrix.service }}.log 2>&1 &
+          # wait for service to come up
+          for i in $(seq 1 20); do
+            sleep 1
+            case "${{ matrix.service }}" in
+              user-service) PORT=3001;;
+              product-service) PORT=3002;;
+              order-service) PORT=3003;;
+              payment-service) PORT=3004;;
+            esac
+            if curl -sS http://localhost:${PORT}/health >/dev/null 2>&1; then
+              echo "service ${{ matrix.service }} up on port ${PORT}"
+              break
+            fi
+            echo "waiting for ${{ matrix.service }}..."
+          done
+
+      - name: Health check ${{ matrix.service }}
+        run: |
+          case "${{ matrix.service }}" in
+            user-service) PORT=3001;;
+            product-service) PORT=3002;;
+            order-service) PORT=3003;;
+            payment-service) PORT=3004;;
+          esac
+          curl --fail --retry 5 --retry-connrefused http://localhost:${PORT}/health
+
+      - name: Show last lines of log on failure
+        if: failure()
+        run: |
+          echo "---- last lines of log for ${{ matrix.service }} ----"
+          tail -n 200 ../${{ matrix.service }}.log || true
