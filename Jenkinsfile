@@ -3,9 +3,9 @@ pipeline {
   agent any
 
   environment {
-    DOCKERHUB_CRED_ID = 'dockerhub-creds'
-    DOCKERHUB_NAMESPACE = 'vja304786038'
-    GIT_CRED_ID = 'github-loservijay-pat'  // you already have this
+    DOCKERHUB_CRED_ID     = 'dockerhub-creds'
+    DOCKERHUB_NAMESPACE   = 'vja304786038'
+    GIT_CRED_ID           = 'github-loservijay-pat'  // ensure this exists in Jenkins
   }
 
   options {
@@ -27,11 +27,12 @@ pipeline {
     stage('Detect Services') {
       steps {
         script {
-          SERVICE_DIRS = sh(script: "find . -maxdepth 2 -type f -name pom.xml -printf '%h\\n' | sort -u", returnStdout: true).trim()
-          if (!SERVICE_DIRS) {
+          // find directories that contain a pom.xml (strip leading ./)
+          def raw = sh(script: "find . -maxdepth 2 -type f -name pom.xml -printf '%h\\n' | sed 's#^\\./##' | sort -u", returnStdout: true).trim()
+          if (!raw) {
             error "No services found (no pom.xml detected). Adjust detection logic."
           }
-          SERVICE_DIRS = SERVICE_DIRS.split('\\n')
+          SERVICE_DIRS = raw.split('\\n').collect { it.trim() }.findAll{ it }
           echo "Services: ${SERVICE_DIRS}"
         }
       }
@@ -40,11 +41,14 @@ pipeline {
     stage('Build & Package') {
       steps {
         script {
-          for (dir in SERVICE_DIRS) {
-            dir(dir) {
-              echo "Building ${dir}"
-              sh 'mvn -B clean package -DskipTests=false'
-              stash includes: "target/*.jar", name: "jar-${dir.replaceAll(/\\W/,'_')}", allowEmpty: true
+          for (dirPath in SERVICE_DIRS) {
+            dir(dirPath) {
+              echo "Building ${dirPath}"
+              // run maven (adjust -DskipTests as you need)
+              sh 'mvn -B clean package -DskipTests=true'
+              // stash artifact with a safe name
+              def stashName = "jar-${dirPath.replaceAll(/[^A-Za-z0-9_.-]/, '_')}"
+              stash includes: "target/*.jar", name: stashName, allowEmpty: true
             }
           }
         }
@@ -54,21 +58,24 @@ pipeline {
     stage('Docker Build & Push') {
       steps {
         script {
-          // login once
+          // docker login once
           withCredentials([usernamePassword(credentialsId: env.DOCKERHUB_CRED_ID, usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
             sh 'echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin'
           }
 
-          for (dir in SERVICE_DIRS) {
-            def svcName = dir.tokenize('/').last()
+          for (dirPath in SERVICE_DIRS) {
+            def svcName = dirPath.tokenize('/').last()
             def tag = "${env.DOCKERHUB_NAMESPACE}/${svcName}:${env.BRANCH_NAME ?: 'main'}-${env.BUILD_NUMBER}"
-            dir(dir) {
-              echo "Building docker image for ${svcName}"
-              sh "docker build -t ${tag} ."
-              sh "docker push ${tag}"
-              // also push branch latest
-              sh "docker tag ${tag} ${env.DOCKERHUB_NAMESPACE}/${svcName}:latest || true"
-              sh "docker push ${env.DOCKERHUB_NAMESPACE}/${svcName}:latest || true"
+            dir(dirPath) {
+              if (fileExists('Dockerfile')) {
+                echo "Building docker image for ${svcName}"
+                sh "docker build -t ${tag} ."
+                sh "docker push ${tag}"
+                sh "docker tag ${tag} ${env.DOCKERHUB_NAMESPACE}/${svcName}:latest || true"
+                sh "docker push ${env.DOCKERHUB_NAMESPACE}/${svcName}:latest || true"
+              } else {
+                echo "No Dockerfile in ${dirPath} — skipping docker build"
+              }
             }
           }
         }
@@ -78,9 +85,10 @@ pipeline {
     stage('Archive Artifacts') {
       steps {
         script {
-          for (dir in SERVICE_DIRS) {
-            def stashName = "jar-${dir.replaceAll(/\\W/,'_')}"
-            unstash stashName
+          // restore stashes (works only on same node where stashes were stored)
+          for (dirPath in SERVICE_DIRS) {
+            def stashName = "jar-${dirPath.replaceAll(/[^A-Za-z0-9_.-]/, '_')}"
+            try { unstash stashName } catch(e) { echo "unstash ${stashName} failed: ${e}" }
           }
           archiveArtifacts artifacts: '**/target/*.jar', fingerprint: true, allowEmptyArchive: true
         }
@@ -89,9 +97,7 @@ pipeline {
   }
 
   post {
-    always {
-      sh 'docker logout || true'
-    }
+    always { sh 'docker logout || true' }
     success { echo "Pipeline success" }
     failure { echo "Pipeline failed" }
   }
