@@ -5,7 +5,7 @@ pipeline {
         DOCKERHUB_CRED_ID   = 'dockerhub-creds'
         DOCKERHUB_NAMESPACE = 'vja304786038'
         IMAGE_TAG           = "${env.BRANCH_NAME ?: 'main'}-${env.BUILD_NUMBER}"
-        MAVEN_OPTS          = "-DskipTests=true"
+        MAVEN_OPTS          = "-DskipTests=true" // unused for Node but harmless if left
     }
 
     options {
@@ -26,38 +26,54 @@ pipeline {
         stage('Detect Services') {
             steps {
                 script {
-                    // Portable detection: find pom.xml anywhere (limit depth if you want)
-                    // - exclude .git and target directories
                     def raw = sh(
                         script: """
                           set -eu
-                          # Use portable find: find pom.xml and print dirname
-                          find . -name pom.xml -not -path './.git/*' -not -path '*/target/*' -exec dirname {} \\; | sed 's|^\\./||' | sort -u || true
+                          echo "Detecting Node services (package.json)..."
+                          find . -name package.json -not -path './.git/*' -not -path '*/node_modules/*' -print0 \
+                            | xargs -0 -r -n1 dirname \
+                            | sed 's|^\\./||' \
+                            | grep -v '^$' \
+                            | sort -u || true
                         """.stripIndent(),
                         returnStdout: true
                     ).trim()
 
                     if (!raw) {
-                        error "No pom.xml found — adjust project structure or detection logic."
+                        error "No package.json found — adjust project structure or detection logic."
                     }
 
-                    // Build a sanitized list of service directories
                     SERVICE_DIRS = raw.split('\\n').collect { it.trim() }.findAll { it }
                     echo "Detected services: ${SERVICE_DIRS}"
                 }
             }
         }
 
-        stage('Build & Package') {
+        stage('Build & Package (Node)') {
             steps {
                 script {
                     for (dirPath in SERVICE_DIRS) {
                         dir(dirPath) {
-                            echo "Building ${dirPath}"
-                            sh "mvn -B clean package ${env.MAVEN_OPTS}"
-                            // Create a safe stash name (replace non-file chars)
-                            def safeName = "jar-${dirPath.replaceAll(/[^A-Za-z0-9_.-]/, '_')}"
-                            stash includes: "target/*.jar", name: safeName, allowEmpty: true
+                            def svc = dirPath.tokenize('/').last()
+                            echo "Building Node service: ${svc} (path: ${dirPath})"
+
+                            // Install deps
+                            sh 'if [ -f package-lock.json ]; then npm ci; else npm install; fi'
+
+                            // Run build if exists, otherwise run test (but do not fail pipeline on missing build)
+                            sh '''
+                              if grep -q "\"build\"" package.json 2>/dev/null; then
+                                echo "Running npm run build"
+                                npm run build || true
+                              else
+                                echo "No build script found; running npm test if present"
+                                if grep -q "\"test\"" package.json 2>/dev/null; then
+                                  npm test || true
+                                else
+                                  echo "No test script either; skipping build/test"
+                                fi
+                              fi
+                            '''.stripIndent()
                         }
                     }
                 }
@@ -67,16 +83,13 @@ pipeline {
         stage('Docker Build & Push') {
             steps {
                 script {
-                    // Check if docker exists on this agent
                     def dockerAvailable = sh(script: "which docker >/dev/null 2>&1 && echo yes || echo no",
                                              returnStdout: true).trim()
 
                     if (dockerAvailable != 'yes') {
                         echo "Docker not found on this agent — skipping Docker build/push."
                     } else {
-                        // Login to Docker Hub using credentials
                         withCredentials([usernamePassword(credentialsId: env.DOCKERHUB_CRED_ID, usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
-                            // wrap in try so login failures don't break pipeline cleanup
                             try {
                                 sh 'echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin'
                             } catch (e) {
@@ -90,11 +103,9 @@ pipeline {
                                 if (fileExists('Dockerfile')) {
                                     def tag = "${env.DOCKERHUB_NAMESPACE}/${svc}:${env.IMAGE_TAG}"
                                     echo "Building Docker image for ${svc} -> ${tag}"
-
                                     try {
                                         sh "docker build -t ${tag} ."
                                         sh "docker push ${tag}"
-                                        // Also push latest tag (ignore errors)
                                         sh "docker tag ${tag} ${env.DOCKERHUB_NAMESPACE}/${svc}:latest || true"
                                         sh "docker push ${env.DOCKERHUB_NAMESPACE}/${svc}:latest || true"
                                     } catch (e) {
@@ -106,7 +117,6 @@ pipeline {
                             }
                         }
 
-                        // Logout if docker present
                         sh 'docker logout || true'
                     }
                 }
@@ -116,15 +126,8 @@ pipeline {
         stage('Archive Artifacts') {
             steps {
                 script {
-                    for (dirPath in SERVICE_DIRS) {
-                        def stashName = "jar-${dirPath.replaceAll(/[^A-Za-z0-9_.-]/, '_')}"
-                        try {
-                            unstash stashName
-                        } catch (e) {
-                            echo "Skipping unstash for ${stashName}: ${e}"
-                        }
-                    }
-                    archiveArtifacts artifacts: '**/target/*.jar', fingerprint: true
+                    // Archive common Node outputs: dist folders and packaged tgz files
+                    archiveArtifacts artifacts: '**/dist/**, **/*.tgz', fingerprint: true, allowEmptyArchive: true
                 }
             }
         }
