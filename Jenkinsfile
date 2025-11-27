@@ -24,7 +24,6 @@ pipeline {
         stage('Detect Services') {
             steps {
                 script {
-                    // Run detection; write informational echo to stderr so returnStdout does not capture it
                     def raw = sh(
                         script: '''
                           set -eu
@@ -45,7 +44,6 @@ pipeline {
                         error "No package.json found — adjust project structure or detection logic."
                     }
 
-                    // declare local var and also expose as env var for later stages
                     def svcList = raw.split('\n').collect { it.trim() }.findAll { it }
                     env.SERVICE_DIRS_LIST = svcList.join(',')
                     echo "Detected services: ${svcList}"
@@ -56,13 +54,11 @@ pipeline {
         stage('Build & Package (Node)') {
             steps {
                 script {
-                    // read back the env list
                     def SERVICE_DIRS = env.SERVICE_DIRS_LIST?.trim() ? env.SERVICE_DIRS_LIST.split(',') : []
                     if (!SERVICE_DIRS) {
                         error "SERVICE_DIRS is empty — aborting build."
                     }
 
-                    // Check docker availability once
                     def dockerAvailable = sh(script: "which docker >/dev/null 2>&1 && echo yes || echo no", returnStdout: true).trim()
                     echo "Docker available: ${dockerAvailable}"
 
@@ -72,12 +68,10 @@ pipeline {
                             echo "=== Building service: ${svc} (path: ${dirPath}) ==="
 
                             if (dockerAvailable == 'yes') {
-                                // Use official node image for a clean, consistent environment
-                                echo "Building inside node:18 Docker image"
+                                echo "Building inside node:18 Docker image for ${svc}"
                                 docker.image('node:18').inside('--workdir /workspace') {
                                     sh '''
                                       set -eux
-                                      # ensure workspace contains repo files (mounted by Jenkins)
                                       ls -la .
                                       if [ -f package-lock.json ]; then
                                         npm ci
@@ -95,12 +89,13 @@ pipeline {
                                     '''
                                 }
                             } else {
-                                // Fallback: try to run npm on the current agent
-                                echo "Docker not available — attempting to run npm on this agent"
+                                echo "Docker not available — attempting to run npm on this agent for ${svc}"
+                                // Use Groovy interpolation for svc where needed; avoid ${svc} in single-quoted blocks.
+                                // Here we use a single-line sh with Groovy interpolation for the tar command below.
                                 sh '''
                                   set -eux
                                   if ! command -v npm >/dev/null 2>&1; then
-                                    echo "npm not found on agent — skipping build for ${svc}"
+                                    echo "npm not found on agent — skipping build for service"
                                     exit 0
                                   fi
 
@@ -120,8 +115,8 @@ pipeline {
                                 '''
                             }
 
-                            // optional: create an artifact archive location inside service
-                            sh 'tar -czf ${WORKSPACE}/${svc}-artifact.tgz . || true'
+                            // Create an artifact tar using Groovy interpolation to include svc name
+                            sh "tar -czf \"${env.WORKSPACE}/${svc}-artifact.tgz\" . || true"
                         }
                     }
                 }
@@ -131,7 +126,6 @@ pipeline {
         stage('Docker Build & Push') {
             steps {
                 script {
-                    // If Docker not available, skip
                     def dockerAvailable = sh(script: "which docker >/dev/null 2>&1 && echo yes || echo no", returnStdout: true).trim()
                     if (dockerAvailable != 'yes') {
                         echo "Docker not available on agent — skipping Docker build/push."
@@ -167,7 +161,6 @@ pipeline {
         stage('Archive Artifacts') {
             steps {
                 script {
-                    // Archive packaged tgz artifacts plus dist folders
                     archiveArtifacts artifacts: '**/dist/**, **/*-artifact.tgz, **/*.tgz', allowEmptyArchive: true, fingerprint: true
                 }
             }
