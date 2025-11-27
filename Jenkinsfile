@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     environment {
-        DOCKERHUB_CRED_ID   = 'dockerhub-creds'
+        DOCKERHUB_CRED_ID   = 'Dockerhub-creds'
         DOCKERHUB_NAMESPACE = 'vja304786038'
         IMAGE_TAG           = "${env.BRANCH_NAME ?: 'main'}-${env.BUILD_NUMBER}"
     }
